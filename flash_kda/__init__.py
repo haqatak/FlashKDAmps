@@ -1,6 +1,10 @@
 import torch
-from flash_kda_C import fwd as _fwd_raw, get_workspace_size
-
+try:
+    from flash_kda_C import fwd as _fwd_raw, get_workspace_size
+    _HAS_EXT = True
+except ImportError:
+    _HAS_EXT = False
+from .fallback import fwd_fallback
 
 def fwd(q, k, v, g, beta, scale, out, A_log, dt_bias, lower_bound, initial_state=None, final_state=None, cu_seqlens=None):
     """FlashKDA forward (Flash Kimi Delta Attention).
@@ -31,11 +35,15 @@ def fwd(q, k, v, g, beta, scale, out, A_log, dt_bias, lower_bound, initial_state
         * All input tensors must be CUDA, contiguous, and have the dtypes
           listed above.
     """
-    B, T_seq, H = q.shape[0], q.shape[1], q.shape[2]
-    T_total = B * T_seq
-    N = cu_seqlens.numel() - 1 if cu_seqlens is not None else B
+    if _HAS_EXT and q.device.type == "cuda":
+        B, T_seq, H = q.shape[0], q.shape[1], q.shape[2]
+        T_total = B * T_seq
+        N = cu_seqlens.numel() - 1 if cu_seqlens is not None else B
 
-    workspace = torch.empty(get_workspace_size(T_total, H, N), dtype=torch.uint8, device=q.device)
+        workspace = torch.empty(get_workspace_size(T_total, H, N), dtype=torch.uint8, device=q.device)
 
-    _fwd_raw(q, k, v, g, beta, float(scale), out, workspace, A_log, dt_bias, lower_bound,
-             initial_state=initial_state, final_state=final_state, cu_seqlens=cu_seqlens)
+        _fwd_raw(q, k, v, g, beta, float(scale), out, workspace, A_log, dt_bias, lower_bound,
+                 initial_state=initial_state, final_state=final_state, cu_seqlens=cu_seqlens)
+    else:
+        fwd_fallback(q, k, v, g, beta, scale, out, A_log, dt_bias, lower_bound,
+                     initial_state=initial_state, final_state=final_state, cu_seqlens=cu_seqlens)

@@ -7,8 +7,9 @@ def pytest_configure(config):
         return
     worker = os.environ.get("PYTEST_XDIST_WORKER", None)
     if worker is not None:
-        gpu_count = torch.cuda.device_count()
-        worker_id = int(worker.replace("gw", ""))
-        gpu_id = worker_id % gpu_count
-        os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
-        torch.cuda.set_device(0)
+        if torch.cuda.is_available():
+            gpu_count = torch.cuda.device_count()
+            worker_id = int(worker.replace("gw", ""))
+            gpu_id = worker_id % gpu_count
+            os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
+            torch.cuda.set_device(0)
