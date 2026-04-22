@@ -17,6 +17,27 @@ pip install -v .
 
 Once installed, FlashKDA can be used directly as a backend of `flash-linear-attention`. See [fla-org/flash-linear-attention#852](https://github.com/fla-org/flash-linear-attention/pull/852) for integration details.
 
+## Apple Silicon / MPS Support
+
+FlashKDA supports seamless execution on Apple Silicon (`mps`) and CPUs. When installing the package on a non-CUDA machine, the high-performance C++ extensions are automatically bypassed during compilation.
+
+At runtime, if the C++ extension is unavailable or if inputs are passed using the `mps` or `cpu` device, FlashKDA will automatically route execution to a pure PyTorch fallback implementation.
+
+No configuration changes are required to use this fallback:
+```python
+import torch
+import flash_kda
+
+device = "mps" if torch.backends.mps.is_available() else "cpu"
+
+q = torch.randn(1, 128, 96, 128, dtype=torch.bfloat16, device=device)
+# ... initialize other inputs on the `device` ...
+
+# Automatically uses the pure PyTorch MPS/CPU fallback
+flash_kda.fwd(q, k, v, g, beta, scale, out, A_log, dt_bias, lower_bound)
+```
+Note that performance on the fallback implementation will be significantly slower than on dedicated NVIDIA hardware using the CUTLASS kernels.
+
 ## Performance
 
 See [BENCHMARK_H20.md](BENCHMARK_H20.md).
