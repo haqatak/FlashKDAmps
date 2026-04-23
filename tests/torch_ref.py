@@ -242,10 +242,6 @@ def torch_ref(q, k, v, g, beta, scale, out, A_log, dt_bias, lower_bound, initial
             raise TypeError(f"Expected g.dtype to be torch.bfloat16, got {g.dtype}")
         if dt_bias.dtype != torch.float32:
             raise TypeError(f"Expected dt_bias.dtype to be torch.float32, got {dt_bias.dtype}")
-        g = g.to(torch.float32) + dt_bias.unsqueeze(0)
-        a_log_exp = fp32_ex2_ftz(A_log * LOG2E).unsqueeze(0).unsqueeze(-1)
-        scale = lower_bound * LOG2E
-        g = scale * sigmoid_ext.sigmoid_tanh_fp32(a_log_exp * g)
         g = _apply_a_log(g, A_log, dt_bias, lower_bound)
 
     state_fp32 = (initial_state is not None and initial_state.dtype == torch.float32) or \
