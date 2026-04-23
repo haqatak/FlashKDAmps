@@ -3,6 +3,29 @@ import pytest
 from flash_kda.fallback import fp32_ex2_ftz
 from unittest.mock import patch, MagicMock
 import flash_kda
+from flash_kda.fallback import sigmoid_tanh_fp32
+
+def test_sigmoid_tanh_fp32():
+    # Test random inputs
+    torch.manual_seed(42)
+    x = torch.randn(10, 10, dtype=torch.float32)
+    res = sigmoid_tanh_fp32(x)
+
+    # Check against the exact formula used
+    expected_formula = torch.tanh(x * 0.5) * 0.5 + 0.5
+    assert torch.allclose(res, expected_formula)
+
+    # Check against actual sigmoid (should be a good approximation)
+    expected_sigmoid = torch.sigmoid(x)
+    # The approximation might have a small error compared to true sigmoid
+    # According to our sandbox test, it's very close!
+    assert torch.allclose(res, expected_sigmoid, atol=1e-2)
+
+    # Test extreme values (should clamp to 0 and 1)
+    x_ext = torch.tensor([-100.0, 100.0], dtype=torch.float32)
+    res_ext = sigmoid_tanh_fp32(x_ext)
+    assert torch.allclose(res_ext, torch.tensor([0.0, 1.0], dtype=torch.float32))
+from flash_kda.fallback import fp32_ex2_ftz, fp32_fma
 
 def test_fp32_ex2_ftz():
     # Test typical float32 values
@@ -93,3 +116,42 @@ def test_fwd_fallback_dispatch():
         assert kwargs["initial_state"] is None
         assert kwargs["final_state"] is None
         assert kwargs["cu_seqlens"] is None
+def test_fp32_fma():
+    # 1. Test basic correct computation and output type
+    c = torch.tensor([1.0, 2.0, 3.0], dtype=torch.float32)
+    a = torch.tensor([4.0, 5.0, 6.0], dtype=torch.float32)
+    b = torch.tensor([7.0, 8.0, 9.0], dtype=torch.float32)
+
+    res = fp32_fma(c, a, b)
+    expected = torch.tensor([29.0, 42.0, 57.0], dtype=torch.float32)
+
+    torch.testing.assert_close(res, expected)
+    assert res.dtype == torch.float32
+
+    # 2. Test assertion failures for non-float32 inputs
+    with pytest.raises(AssertionError):
+        fp32_fma(c.to(torch.float64), a, b)
+    with pytest.raises(AssertionError):
+        fp32_fma(c, a.to(torch.float16), b)
+    with pytest.raises(AssertionError):
+        fp32_fma(c, a, b.to(torch.bfloat16))
+
+    # 3. Test precision benefits of intermediate float64
+    # We choose values that fit exactly in float32, but their product requires more than 24 bits.
+    # a = 4097.0 (2^12 + 1), b = 4097.0 (2^12 + 1)
+    # a * b = 16785409.0, which needs 25 bits.
+    # In float32, a * b is rounded to 16785408.0.
+    # So if we subtract 16785408.0 (c = -16785408.0), a native float32 `c + a * b` gives 0.0.
+    # But doing it in float64 intermediate gives `16785409.0 - 16785408.0 = 1.0`.
+    a_prec = torch.tensor([4097.0], dtype=torch.float32)
+    b_prec = torch.tensor([4097.0], dtype=torch.float32)
+    c_prec = torch.tensor([-16785408.0], dtype=torch.float32)
+
+    res_prec = fp32_fma(c_prec, a_prec, b_prec)
+    res_naive = c_prec + a_prec * b_prec
+
+    # In pure float32, this evaluates to 0.0
+    assert res_naive.item() == 0.0
+
+    # With intermediate float64, it correctly retains the lost precision and returns 1.0
+    assert res_prec.item() == 1.0
