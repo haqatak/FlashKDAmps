@@ -1,6 +1,8 @@
 import torch
 import pytest
 from flash_kda.fallback import fp32_ex2_ftz
+from unittest.mock import patch, MagicMock
+import flash_kda
 
 def test_fp32_ex2_ftz():
     # Test typical float32 values
@@ -36,3 +38,58 @@ def test_fp32_ex2_ftz():
     x_flush = torch.tensor([-127.0, -150.0], dtype=torch.float32)
     res_flush = fp32_ex2_ftz(x_flush)
     assert torch.all(res_flush == 0.0)
+
+
+def test_fwd_fallback_dispatch():
+    # Setup dummy tensors (on CPU, so q.device.type == "cpu")
+    B, T, H, K, V = 1, 2, 4, 128, 128
+    q = torch.randn(B, T, H, K, dtype=torch.bfloat16)
+    k = torch.randn(B, T, H, K, dtype=torch.bfloat16)
+    v = torch.randn(B, T, H, V, dtype=torch.bfloat16)
+    g = torch.randn(B, T, H, K, dtype=torch.bfloat16)
+    beta = torch.randn(B, T, H, dtype=torch.bfloat16)
+    scale = 0.1
+    out = torch.zeros_like(v)
+    A_log = torch.randn(H, dtype=torch.float32)
+    dt_bias = torch.randn(H, K, dtype=torch.float32)
+    lower_bound = -5.0
+    initial_state = torch.randn(B, H, V, K, dtype=torch.bfloat16)
+    final_state = torch.randn(B, H, V, K, dtype=torch.bfloat16)
+    cu_seqlens = torch.tensor([0, T], dtype=torch.int64)
+
+    # 1. Test when _HAS_EXT is True, but device is CPU -> should fallback
+    with patch("flash_kda._HAS_EXT", True), \
+         patch("flash_kda.fwd_fallback") as mock_fallback:
+
+        flash_kda.fwd(q, k, v, g, beta, scale, out, A_log, dt_bias, lower_bound,
+                      initial_state=initial_state, final_state=final_state, cu_seqlens=cu_seqlens)
+
+        mock_fallback.assert_called_once()
+        # Verify it was called with the exact arguments
+        args, kwargs = mock_fallback.call_args
+        assert args[0] is q
+        assert args[1] is k
+        assert args[2] is v
+        assert args[3] is g
+        assert args[4] is beta
+        assert args[5] == scale
+        assert args[6] is out
+        assert args[7] is A_log
+        assert args[8] is dt_bias
+        assert args[9] == lower_bound
+        assert kwargs["initial_state"] is initial_state
+        assert kwargs["final_state"] is final_state
+        assert kwargs["cu_seqlens"] is cu_seqlens
+
+    # 2. Test when _HAS_EXT is False -> should fallback regardless of device
+    with patch("flash_kda._HAS_EXT", False), \
+         patch("flash_kda.fwd_fallback") as mock_fallback:
+
+        flash_kda.fwd(q, k, v, g, beta, scale, out, A_log, dt_bias, lower_bound)
+
+        mock_fallback.assert_called_once()
+        args, kwargs = mock_fallback.call_args
+        assert args[0] is q
+        assert kwargs["initial_state"] is None
+        assert kwargs["final_state"] is None
+        assert kwargs["cu_seqlens"] is None
