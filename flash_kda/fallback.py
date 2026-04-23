@@ -14,9 +14,12 @@ def fp32_ex2_ftz(x):
     return ret
 
 def fp32_fma(c, a, b):
-    assert c.dtype == torch.float32
-    assert a.dtype == torch.float32
-    assert b.dtype == torch.float32
+    if c.dtype != torch.float32:
+        raise TypeError(f"Expected c.dtype to be torch.float32, got {c.dtype}")
+    if a.dtype != torch.float32:
+        raise TypeError(f"Expected a.dtype to be torch.float32, got {a.dtype}")
+    if b.dtype != torch.float32:
+        raise TypeError(f"Expected b.dtype to be torch.float32, got {b.dtype}")
     return (c.to(torch.float64) + a.to(torch.float64) * b.to(torch.float64)).to(torch.float32)
 
 def l2_normalize_kernel_match(x):
@@ -52,10 +55,12 @@ def fwd_fallback(q, k, v, g, beta, scale, out, A_log, dt_bias, lower_bound, init
 
     Input: [B, T, H, D] (4D). B must be 1 when cu_seqlens is provided.
     """
-    assert q.dim() == 4, f"Expected 4D input [B, T, H, D], got {q.dim()}D"
+    if q.dim() != 4:
+        raise ValueError(f"Expected 4D input [B, T, H, D], got {q.dim()}D")
     B = q.shape[0]
     if cu_seqlens is not None:
-        assert B == 1, f"B must be 1 when cu_seqlens is provided, got B={B}"
+        if B != 1:
+            raise ValueError(f"B must be 1 when cu_seqlens is provided, got B={B}")
 
     q = q.reshape(-1, *q.shape[2:])
     k = k.reshape(-1, *k.shape[2:])
@@ -77,10 +82,14 @@ def fwd_fallback(q, k, v, g, beta, scale, out, A_log, dt_bias, lower_bound, init
     k = l2_normalize_kernel_match(k)
 
     if A_log is not None:
-        assert dt_bias is not None
-        assert A_log.dtype == torch.float32
-        assert g.dtype == torch.bfloat16
-        assert dt_bias.dtype == torch.float32
+        if dt_bias is None:
+            raise ValueError("dt_bias must be provided when A_log is provided")
+        if A_log.dtype != torch.float32:
+            raise TypeError(f"Expected A_log.dtype to be torch.float32, got {A_log.dtype}")
+        if g.dtype != torch.bfloat16:
+            raise TypeError(f"Expected g.dtype to be torch.bfloat16, got {g.dtype}")
+        if dt_bias.dtype != torch.float32:
+            raise TypeError(f"Expected dt_bias.dtype to be torch.float32, got {dt_bias.dtype}")
         g = g.to(torch.float32) + dt_bias.unsqueeze(0)
         a_log_exp = fp32_ex2_ftz(A_log * LOG2E).unsqueeze(0).unsqueeze(-1)
         scale = lower_bound * LOG2E
