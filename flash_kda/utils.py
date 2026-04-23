@@ -19,6 +19,8 @@ def fp32_fma(c, a, b):
     assert c.dtype == torch.float32
     assert a.dtype == torch.float32
     assert b.dtype == torch.float32
+    if c.device.type == 'mps':
+        return torch.addcmul(c, a, b)
     return (c.to(torch.float64) + a.to(torch.float64) * b.to(torch.float64)).to(torch.float32)
 
 
