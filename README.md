@@ -17,6 +17,46 @@ pip install -v .
 
 Once installed, FlashKDA can be used directly as a backend of `flash-linear-attention`. See [fla-org/flash-linear-attention#852](https://github.com/fla-org/flash-linear-attention/pull/852) for integration details.
 
+## Apple Silicon / MPS Support
+
+FlashKDA supports Apple Silicon (M-series chips) natively. When a CUDA device is not available, it automatically falls back to a pure PyTorch implementation optimized for MPS (`mps`).
+
+To install on Apple Silicon without building the CUDA extensions, you simply run:
+
+```bash
+git clone https://github.com/MoonshotAI/FlashKDA.git flash-kda
+cd flash-kda
+pip install -v .
+```
+
+To run FlashKDA on MPS, ensure your tensors are placed on the `mps` device:
+
+```python
+import torch
+import flash_kda
+
+device = torch.device("mps")
+
+# Create sample inputs
+B, T, H, K = 1, 1024, 4, 128
+V = K
+
+q = torch.randn(B, T, H, K, dtype=torch.bfloat16, device=device)
+k = torch.randn(B, T, H, K, dtype=torch.bfloat16, device=device)
+v = torch.randn(B, T, H, V, dtype=torch.bfloat16, device=device)
+g = torch.randn(B, T, H, K, dtype=torch.bfloat16, device=device)
+beta = torch.randn(B, T, H, dtype=torch.bfloat16, device=device)
+scale = 1.0 / (K ** 0.5)
+out = torch.zeros_like(v)
+
+A_log = torch.randn(H, dtype=torch.float32, device=device)
+dt_bias = torch.randn(H, K, dtype=torch.float32, device=device)
+lower_bound = -5.0
+
+# Run FlashKDA forward
+flash_kda.fwd(q, k, v, g, beta, scale, out, A_log, dt_bias, lower_bound)
+```
+
 ## Performance
 
 See [BENCHMARK_H20.md](BENCHMARK_H20.md).

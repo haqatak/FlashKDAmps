@@ -39,6 +39,7 @@ def l2_normalize_kernel_match(x):
 
     inv_norm = torch.rsqrt(partials[..., 0:1] + 1e-6)
     return (x_f32 * inv_norm).to(x.dtype)
+from .utils import LOG2E, fp32_ex2_ftz, fp32_fma, l2_normalize_kernel_match
 
 # ============================================================
 # Fallback implementations without CUDA custom kernels
@@ -140,7 +141,7 @@ def fwd_fallback(q, k, v, g, beta, scale, out, A_log, dt_bias, lower_bound, init
                 k_inv = k_chunk * neg_g_cumsum_bf16
                 g_total_exp_bf16 = fp32_ex2_ftz(g_total).to(torch.bfloat16)
                 k_restored = k_inv * g_total_exp_bf16
-                L = torch.mm(k_decayed, k_inv.t()).to(torch.float16)
+                L = torch.matmul(k_decayed.to(torch.float32), k_inv.t().to(torch.float32)).to(torch.float16)
                 Mqk = torch.matmul(q_decayed, k_inv.t())
 
                 # Fuse sigmoid via tanh.approx: beta is bf16 logits
@@ -168,7 +169,7 @@ def fwd_fallback(q, k, v, g, beta, scale, out, A_log, dt_bias, lower_bound, init
                 _out = torch.matmul(q_decayed, state_slice.t())
                 _out = _out + torch.matmul(Mqk, U)
 
-                delta_s = torch.mm(k_restored.t(), U.to(k_restored.dtype)).to(torch.float32)
+                delta_s = torch.matmul(k_restored.t().to(torch.float32), U.to(torch.float32))
 
                 g_total_exp = fp32_ex2_ftz(g_total)
                 g_total_exp = g_total_exp.squeeze(0).unsqueeze(-1)
