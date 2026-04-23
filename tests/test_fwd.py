@@ -227,6 +227,20 @@ def plot_error_comparison(results, save_path):
 # Tests
 # ============================================================
 
+def _make_inputs(B, T, H, D, device=None):
+    if device is None:
+        device = get_device()
+    q = F.normalize(torch.randn((B, T, H, D), dtype=torch.float32, device=device), p=2, dim=-1).to(torch.bfloat16)
+    k = F.normalize(torch.randn((B, T, H, D), dtype=torch.float32, device=device), p=2, dim=-1).to(torch.bfloat16)
+    v = torch.randn((B, T, H, D), dtype=torch.bfloat16, device=device)
+    g = torch.randn((B, T, H, D), dtype=torch.bfloat16, device=device)
+    beta = torch.randn((B, T, H), dtype=torch.bfloat16, device=device)
+    A_log = torch.rand(H, dtype=torch.float32, device=device)
+    dt_bias = torch.rand(H, D, dtype=torch.float32, device=device)
+    scale = 1.0 / math.sqrt(D)
+    return q, k, v, g, beta, A_log, dt_bias, scale
+
+
 def test_fwd():
     """Test: cutlass kernel vs torch ref, require exact match."""
     B, T, H, D = 1, 8192, 96, 128
@@ -235,17 +249,9 @@ def test_fwd():
     print(f"Testing shape: [{B}, {T}, {H}, {D}]")
     torch.manual_seed(0)
 
-    q = F.normalize(torch.randn((B, T, H, D), dtype=torch.float32, device=get_device()), p=2, dim=-1).to(torch.bfloat16)
-    k = F.normalize(torch.randn((B, T, H, D), dtype=torch.float32, device=get_device()), p=2, dim=-1).to(torch.bfloat16)
-    v = torch.randn((B, T, H, D), dtype=torch.bfloat16, device=get_device())
-    g = torch.randn((B, T, H, D), dtype=torch.bfloat16, device=get_device())
-    beta = torch.randn((B, T, H), dtype=torch.bfloat16, device=get_device())
-
-    A_log = torch.rand(H, dtype=torch.float32, device=get_device())
-    dt_bias = torch.rand(H, D, dtype=torch.float32, device=get_device())
+    q, k, v, g, beta, A_log, dt_bias, scale = _make_inputs(B, T, H, D)
 
     initial_state = torch.arange(H * D * D, dtype=torch.float32, device=get_device()).reshape(1, H, D, D).to(torch.bfloat16)
-    scale = 1.0 / math.sqrt(D)
 
     # cutlass kernel
     final_state_kernel = torch.zeros_like(initial_state)
@@ -286,17 +292,9 @@ def test_fwd_varlen():
     print(f"\ntest_fwd_varlen: seq_lens={seq_lens}, T_total={T_total}, N={N}, H={H}, D={D}")
     torch.manual_seed(0)
 
-    q = F.normalize(torch.randn((1, T_total, H, D), dtype=torch.float32, device=get_device()), p=2, dim=-1).to(torch.bfloat16)
-    k = F.normalize(torch.randn((1, T_total, H, D), dtype=torch.float32, device=get_device()), p=2, dim=-1).to(torch.bfloat16)
-    v = torch.randn((1, T_total, H, D), dtype=torch.bfloat16, device=get_device())
-    g = torch.randn((1, T_total, H, D), dtype=torch.bfloat16, device=get_device())
-    beta = torch.randn((1, T_total, H), dtype=torch.bfloat16, device=get_device())
-
-    A_log = torch.rand(H, dtype=torch.float32, device=get_device())
-    dt_bias = torch.rand(H, D, dtype=torch.float32, device=get_device())
+    q, k, v, g, beta, A_log, dt_bias, scale = _make_inputs(1, T_total, H, D)
 
     initial_state = torch.arange(N * H * D * D, dtype=torch.float32, device=get_device()).reshape(N, H, D, D).to(torch.bfloat16)
-    scale = 1.0 / math.sqrt(D)
 
     # cutlass kernel
     final_state_kernel = torch.zeros_like(initial_state)
