@@ -137,6 +137,60 @@ def l2_normalize_kernel_match(x):
 # Torch reference implementation
 # ============================================================
 
+def _apply_a_log(g, A_log, dt_bias, lower_bound):
+    assert dt_bias is not None
+    assert A_log.dtype == torch.float32
+    assert g.dtype == torch.bfloat16
+    assert dt_bias.dtype == torch.float32
+    g = g.to(torch.float32) + dt_bias.unsqueeze(0)
+    a_log_exp = fp32_ex2_ftz(A_log * LOG2E).unsqueeze(0).unsqueeze(-1)
+    scale = lower_bound * LOG2E
+    return scale * sigmoid_ext.sigmoid_tanh_fp32(a_log_exp * g)
+
+def _process_chunk(g_chunk, q_chunk, k_chunk, v_chunk, beta_chunk, state_slice, scale_bf16, CHUNK, device):
+    g_cumsum = g_chunk.cumsum(dim=0)
+    g_total = g_cumsum[-1:]
+    k_decayed = k_chunk * fp32_ex2_ftz(g_cumsum).to(torch.bfloat16)
+    q_decayed = q_chunk * fp32_ex2_ftz(g_cumsum).to(torch.bfloat16) * scale_bf16
+    neg_g_cumsum_bf16 = fp32_ex2_ftz(-g_cumsum).to(torch.bfloat16)
+    k_inv = k_chunk * neg_g_cumsum_bf16
+    g_total_exp_bf16 = fp32_ex2_ftz(g_total).to(torch.bfloat16)
+    k_restored = k_inv * g_total_exp_bf16
+    L = torch.matmul(k_decayed.to(torch.float32), k_inv.t().to(torch.float32)).to(torch.float16)
+    Mqk = torch.matmul(q_decayed, k_inv.t())
+
+    # Fuse sigmoid via tanh.approx: beta is bf16 logits
+    beta_activated = sigmoid_ext.sigmoid_tanh_fp32(beta_chunk.to(torch.float32))
+    beta_val_bf16 = beta_activated.to(torch.bfloat16).unsqueeze(-1)
+    beta_val_fp16 = beta_activated.to(torch.float16).unsqueeze(-1)
+    L = torch.tril(L, diagonal=-1) * beta_val_fp16
+    Mqk = torch.tril(Mqk)
+
+    INV = torch.eye(CHUNK, dtype=torch.float16, device=device) - L
+    L2 = matmul_fp16acc(L, L)
+    INV = INV + matmul_fp16acc(INV, L2)
+    L4 = matmul_fp16acc(L2, L2)
+    INV = INV + matmul_fp16acc(INV, L4)
+    L8 = matmul_fp16acc(L4, L4)
+    INV = INV + matmul_fp16acc(INV, L8)
+
+    INV = INV.to(torch.bfloat16)
+
+    v_chunk = v_chunk - torch.matmul(k_decayed, state_slice.t())
+    v_chunk = v_chunk * beta_val_bf16
+
+    U = torch.matmul(INV, v_chunk)
+    _out = torch.matmul(q_decayed, state_slice.t())
+    _out = _out + torch.matmul(Mqk, U)
+
+    delta_s = torch.matmul(k_restored.t().to(torch.float32), U.to(torch.float32))
+
+    g_total_exp = fp32_ex2_ftz(g_total)
+    g_total_exp = g_total_exp.squeeze(0).unsqueeze(-1)
+    new_state_slice = fp32_fma(delta_s, state_slice.to(torch.float32).t(), g_total_exp).to(torch.bfloat16).t()
+
+    return _out, new_state_slice
+
 def torch_ref(q, k, v, g, beta, scale, out, A_log, dt_bias, lower_bound, initial_state=None, final_state=None, cu_seqlens=None):
     """Torch reference, supports both fixed-length and variable-length sequences.
 
@@ -170,14 +224,7 @@ def torch_ref(q, k, v, g, beta, scale, out, A_log, dt_bias, lower_bound, initial
     k = l2_normalize_kernel_match(k)
 
     if A_log is not None:
-        assert dt_bias is not None
-        assert A_log.dtype == torch.float32
-        assert g.dtype == torch.bfloat16
-        assert dt_bias.dtype == torch.float32
-        g = g.to(torch.float32) + dt_bias.unsqueeze(0)
-        a_log_exp = fp32_ex2_ftz(A_log * LOG2E).unsqueeze(0).unsqueeze(-1)
-        scale = lower_bound * LOG2E
-        g = scale * sigmoid_ext.sigmoid_tanh_fp32(a_log_exp * g)
+        g = _apply_a_log(g, A_log, dt_bias, lower_bound)
 
     state_fp32 = (initial_state is not None and initial_state.dtype == torch.float32) or \
                  (final_state is not None and final_state.dtype == torch.float32)
@@ -216,47 +263,12 @@ def torch_ref(q, k, v, g, beta, scale, out, A_log, dt_bias, lower_bound, initial
                 v_chunk[:actual_len] = v[t0:t0 + actual_len, h, :]
                 beta_chunk[:actual_len] = beta[t0:t0 + actual_len, h]
 
-                g_cumsum = g_chunk.cumsum(dim=0)
-                g_total = g_cumsum[-1:]
-                k_decayed = k_chunk * fp32_ex2_ftz(g_cumsum).to(torch.bfloat16)
-                q_decayed = q_chunk * fp32_ex2_ftz(g_cumsum).to(torch.bfloat16) * scale_bf16
-                neg_g_cumsum_bf16 = fp32_ex2_ftz(-g_cumsum).to(torch.bfloat16)
-                k_inv = k_chunk * neg_g_cumsum_bf16
-                g_total_exp_bf16 = fp32_ex2_ftz(g_total).to(torch.bfloat16)
-                k_restored = k_inv * g_total_exp_bf16
-                L = torch.matmul(k_decayed.to(torch.float32), k_inv.t().to(torch.float32)).to(torch.float16)
-                Mqk = torch.matmul(q_decayed, k_inv.t())
-
-                # Fuse sigmoid via tanh.approx: beta is bf16 logits
-                beta_activated = sigmoid_ext.sigmoid_tanh_fp32(beta_chunk.to(torch.float32))
-                beta_val_bf16 = beta_activated.to(torch.bfloat16).unsqueeze(-1)
-                beta_val_fp16 = beta_activated.to(torch.float16).unsqueeze(-1)
-                L = torch.tril(L, diagonal=-1) * beta_val_fp16
-                Mqk = torch.tril(Mqk)
-
-                INV = torch.eye(CHUNK, dtype=torch.float16, device=device) - L
-                L2 = matmul_fp16acc(L, L)
-                INV = INV + matmul_fp16acc(INV, L2)
-                L4 = matmul_fp16acc(L2, L2)
-                INV = INV + matmul_fp16acc(INV, L4)
-                L8 = matmul_fp16acc(L4, L4)
-                INV = INV + matmul_fp16acc(INV, L8)
-
-                INV = INV.to(torch.bfloat16)
-
                 state_slice = work_state[seq_idx, h]
-                v_chunk = v_chunk - torch.matmul(k_decayed, state_slice.t())
-                v_chunk = v_chunk * beta_val_bf16
-
-                U = torch.matmul(INV, v_chunk)
-                _out = torch.matmul(q_decayed, state_slice.t())
-                _out = _out + torch.matmul(Mqk, U)
-
-                delta_s = torch.matmul(k_restored.t().to(torch.float32), U.to(torch.float32))
-
-                g_total_exp = fp32_ex2_ftz(g_total)
-                g_total_exp = g_total_exp.squeeze(0).unsqueeze(-1)
-                work_state[seq_idx, h] = fp32_fma(delta_s, state_slice.to(torch.float32).t(), g_total_exp).to(torch.bfloat16).t()
+                _out, new_state_slice = _process_chunk(
+                    g_chunk, q_chunk, k_chunk, v_chunk, beta_chunk,
+                    state_slice, scale_bf16, CHUNK, device
+                )
+                work_state[seq_idx, h] = new_state_slice
 
                 out[t0:t0 + actual_len, h] = _out[:actual_len]
 
