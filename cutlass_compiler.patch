@@ -1,0 +1,45 @@
+diff --git a/python/cutlass_cppgen/backend/compiler.py b/python/cutlass_cppgen/backend/compiler.py
+index 0b66ce8a..8ceaaa31 100644
+--- a/python/cutlass_cppgen/backend/compiler.py
++++ b/python/cutlass_cppgen/backend/compiler.py
+@@ -171,15 +171,25 @@ class ArtifactManager:
+         self.default_compile_options = self._nvcc_compile_options
+
+     def insert_operation(self, op_key, cubin, hostfile, op_name, op_attrs):
++        self.insert_operations([(op_key, cubin, hostfile, op_name, op_attrs)])
++
++    def insert_operations(self, operations):
++        if not operations:
++            return
++
+         connection = sqlite3.connect(CACHE_FILE)
+         cursor = connection.cursor()
+         sqlite_insert_blob_query = """ INSERT OR IGNORE INTO compiled_operations (op_key, cubin, hostbin, op_name, op_attrs) VALUES (?, ?, ?, ?, ?)"""
+
+-        hostbin = convertToBinaryData(hostfile)
+-
+-        data_tuple = (op_key, cubin, hostbin, op_name, json.dumps(op_attrs))
++        data_tuples = []
++        hostbin_cache = {}
++        for op_key, cubin, hostfile, op_name, op_attrs in operations:
++            if hostfile not in hostbin_cache:
++                hostbin_cache[hostfile] = convertToBinaryData(hostfile)
++            hostbin = hostbin_cache[hostfile]
++            data_tuples.append((op_key, cubin, hostbin, op_name, json.dumps(op_attrs)))
+
+-        cursor.execute(sqlite_insert_blob_query, data_tuple)
++        cursor.executemany(sqlite_insert_blob_query, data_tuples)
+         connection.commit()
+         cursor.close()
+
+@@ -457,6 +467,8 @@ class ArtifactManager:
+                 operation_attr.append(op_attr)
+                 self.compiled_cache_host[key] = compiled_host_fns
+
++            operations_to_insert = []
+             for (key, operation_name, operation_attr,) in zip(operation_key, operation_name, operation_attr):
+-                self.insert_operation(
+-                    key, cubin_image, host_file.name, operation_name, operation_attr)
++                operations_to_insert.append((key, cubin_image, host_file.name, operation_name, operation_attr))
++            if operations_to_insert:
++                self.insert_operations(operations_to_insert)

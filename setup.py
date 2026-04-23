@@ -7,6 +7,22 @@ from torch.utils.cpp_extension import CUDAExtension, BuildExtension, CUDA_HOME
 this_dir = os.path.dirname(os.path.abspath(__file__))
 subprocess.run(["git", "submodule", "update", "--init", "cutlass"])
 
+patch_path = os.path.join(this_dir, "cutlass_compiler.patch")
+if os.path.exists(patch_path):
+    # Try to apply the patch inside the cutlass submodule if it's not already applied
+    subprocess.run(
+        ["patch", "-p1", "-N", "--dry-run", "-i", patch_path],
+        cwd=os.path.join(this_dir, "cutlass"),
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    result = subprocess.run(
+        ["patch", "-p1", "-N", "-i", patch_path],
+        cwd=os.path.join(this_dir, "cutlass"),
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+
 
 def is_flag_set(flag: str) -> bool:
     return os.getenv(flag, "FALSE").lower() in ["true", "1", "y", "yes"]
