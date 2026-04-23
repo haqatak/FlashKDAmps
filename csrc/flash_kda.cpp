@@ -22,21 +22,20 @@ int64_t get_workspace_size(
     return H * total_tiles * per_tile_bytes;
 }
 
-void fwd(
-    torch::Tensor q,
-    torch::Tensor k,
-    torch::Tensor v,
-    torch::Tensor g,
-    torch::Tensor beta,
-    float scale,
-    torch::Tensor out,
-    torch::Tensor workspace,
-    torch::Tensor A_log,
-    torch::Tensor dt_bias,
-    double lower_bound,
-    std::optional<torch::Tensor> initial_state = std::nullopt,
-    std::optional<torch::Tensor> final_state = std::nullopt,
-    std::optional<torch::Tensor> cu_seqlens = std::nullopt
+
+inline bool check_tensors(
+    torch::Tensor const& q,
+    torch::Tensor const& k,
+    torch::Tensor const& v,
+    torch::Tensor const& g,
+    torch::Tensor const& beta,
+    torch::Tensor const& out,
+    torch::Tensor const& workspace,
+    torch::Tensor const& A_log,
+    torch::Tensor const& dt_bias,
+    std::optional<torch::Tensor> const& initial_state,
+    std::optional<torch::Tensor> const& final_state,
+    std::optional<torch::Tensor> const& cu_seqlens
 ) {
     TORCH_CHECK(q.is_cuda() && k.is_cuda() && v.is_cuda() && g.is_cuda() && beta.is_cuda() && out.is_cuda() && workspace.is_cuda(),
                 "all tensors must be on CUDA");
@@ -92,7 +91,6 @@ void fwd(
     int64_t T_seq = q.size(1);
     int64_t H = q.size(2);
     int64_t D = q.size(3);
-    int64_t T_total = B * T_seq;
 
     TORCH_CHECK(k.sizes() == q.sizes(), "k must match q shape");
     TORCH_CHECK(v.sizes() == q.sizes(), "v must match q shape");
@@ -105,6 +103,125 @@ void fwd(
     TORCH_CHECK(dt_bias.dim() == 2 && dt_bias.size(0) == H && dt_bias.size(1) == D, "dt_bias must be [H, D]");
 
     TORCH_CHECK(D == 128, "currently only supports D == 128");
+
+    bool is_varlen = cu_seqlens.has_value();
+    int64_t N_val;
+    if (is_varlen) {
+        TORCH_CHECK(B == 1, "B must be 1 when cu_seqlens is provided");
+        auto& cu_seqlens_t = cu_seqlens.value();
+        TORCH_CHECK(cu_seqlens_t.is_cuda(), "cu_seqlens must be on CUDA");
+        TORCH_CHECK(cu_seqlens_t.dtype() == torch::kLong, "cu_seqlens must be int64");
+        TORCH_CHECK(cu_seqlens_t.dim() == 1, "cu_seqlens must be 1D");
+        N_val = cu_seqlens_t.numel() - 1;
+        TORCH_CHECK(N_val > 0, "cu_seqlens must have at least 2 elements");
+    } else {
+        N_val = B;
+    }
+
+    // Validate state shapes: always [N, H, D, D]
+    if (has_state_in) {
+        auto& is = initial_state.value();
+        TORCH_CHECK(is.dim() == 4, "initial_state must be [N, H, D, D]");
+        TORCH_CHECK(is.size(0) == N_val && is.size(1) == H && is.size(2) == D && is.size(3) == D,
+                     "initial_state must be [N, H, D, D]");
+    }
+    if (has_state_out) {
+        auto& fs = final_state.value();
+        TORCH_CHECK(fs.dim() == 4, "final_state must be [N, H, D, D]");
+        TORCH_CHECK(fs.size(0) == N_val && fs.size(1) == H && fs.size(2) == D && fs.size(3) == D,
+                     "final_state must be [N, H, D, D]");
+    }
+
+    return state_fp32;
+}
+
+
+inline void dispatch_fwd(
+    bool has_state_in,
+    bool has_state_out,
+    bool state_fp32,
+    bool is_varlen,
+    cutlass::bfloat16_t const* q_ptr,
+    cutlass::bfloat16_t const* k_ptr,
+    cutlass::bfloat16_t const* v_ptr,
+    cutlass::bfloat16_t const* g_ptr,
+    cutlass::bfloat16_t const* beta_t_ptr,
+    void const* initial_state_raw,
+    float scale_f,
+    void* final_state_raw,
+    cutlass::bfloat16_t* out_ptr,
+    void* workspace_ptr,
+    int total_tiles,
+    int T_total,
+    int H,
+    int N_val,
+    int64_t const* cu_seqlens_dev,
+    float const* A_log_ptr,
+    float const* dt_bias_ptr,
+    float gate_scale,
+    cudaStream_t stream
+) {
+    #define LAUNCH(HI, HO, FP32, VL) \
+        launch_fwd<128, HI, HO, FP32, VL>( \
+            q_ptr, k_ptr, v_ptr, g_ptr, beta_t_ptr, \
+            initial_state_raw, scale_f, final_state_raw, out_ptr, \
+            workspace_ptr, total_tiles, \
+            T_total, H, N_val, cu_seqlens_dev, \
+            A_log_ptr, dt_bias_ptr, gate_scale, stream)
+
+    #define DISPATCH_STATE(VL) \
+        if (!has_state_in && !has_state_out) { \
+            LAUNCH(false, false, false, VL); \
+        } else if (has_state_in && has_state_out && state_fp32) { \
+            LAUNCH(true, true, true, VL); \
+        } else if (has_state_in && has_state_out && !state_fp32) { \
+            LAUNCH(true, true, false, VL); \
+        } else if (!has_state_in && has_state_out && state_fp32) { \
+            LAUNCH(false, true, true, VL); \
+        } else if (!has_state_in && has_state_out && !state_fp32) { \
+            LAUNCH(false, true, false, VL); \
+        } else if (has_state_in && !has_state_out && state_fp32) { \
+            LAUNCH(true, false, true, VL); \
+        } else { \
+            LAUNCH(true, false, false, VL); \
+        }
+
+    if (is_varlen) {
+        DISPATCH_STATE(true);
+    } else {
+        DISPATCH_STATE(false);
+    }
+
+    #undef DISPATCH_STATE
+    #undef LAUNCH
+}
+
+void fwd(
+    torch::Tensor q,
+    torch::Tensor k,
+    torch::Tensor v,
+    torch::Tensor g,
+    torch::Tensor beta,
+    float scale,
+    torch::Tensor out,
+    torch::Tensor workspace,
+    torch::Tensor A_log,
+    torch::Tensor dt_bias,
+    double lower_bound,
+    std::optional<torch::Tensor> initial_state = std::nullopt,
+    std::optional<torch::Tensor> final_state = std::nullopt,
+    std::optional<torch::Tensor> cu_seqlens = std::nullopt
+) {
+    bool state_fp32 = check_tensors(q, k, v, g, beta, out, workspace, A_log, dt_bias, initial_state, final_state, cu_seqlens);
+
+    bool has_state_in = initial_state.has_value();
+    bool has_state_out = final_state.has_value();
+
+    int64_t B = q.size(0);
+    int64_t T_seq = q.size(1);
+    int64_t H = q.size(2);
+    int64_t D = q.size(3);
+    int64_t T_total = B * T_seq;
 
     // Flatten [B, T, H, D] -> [B*T, H, D] (contiguous, same data pointer)
     auto q_3d = q.reshape({T_total, H, D});
@@ -144,30 +261,11 @@ void fwd(
     int64_t const* cu_seqlens_dev = nullptr;
 
     if (is_varlen) {
-        TORCH_CHECK(B == 1, "B must be 1 when cu_seqlens is provided");
         auto& cu_seqlens_t = cu_seqlens.value();
-        TORCH_CHECK(cu_seqlens_t.is_cuda(), "cu_seqlens must be on CUDA");
-        TORCH_CHECK(cu_seqlens_t.dtype() == torch::kLong, "cu_seqlens must be int64");
-        TORCH_CHECK(cu_seqlens_t.dim() == 1, "cu_seqlens must be 1D");
         N_val = cu_seqlens_t.numel() - 1;
-        TORCH_CHECK(N_val > 0, "cu_seqlens must have at least 2 elements");
         cu_seqlens_dev = cu_seqlens_t.data_ptr<int64_t>();
     } else {
         N_val = B;
-    }
-
-    // Validate state shapes: always [N, H, D, D]
-    if (has_state_in) {
-        auto& is = initial_state.value();
-        TORCH_CHECK(is.dim() == 4, "initial_state must be [N, H, D, D]");
-        TORCH_CHECK(is.size(0) == N_val && is.size(1) == H && is.size(2) == D && is.size(3) == D,
-                     "initial_state must be [N, H, D, D]");
-    }
-    if (has_state_out) {
-        auto& fs = final_state.value();
-        TORCH_CHECK(fs.dim() == 4, "final_state must be [N, H, D, D]");
-        TORCH_CHECK(fs.size(0) == N_val && fs.size(1) == H && fs.size(2) == D && fs.size(3) == D,
-                     "final_state must be [N, H, D, D]");
     }
 
     int total_tiles;
@@ -177,40 +275,14 @@ void fwd(
         total_tiles = int(N_val * ((T_seq + CHUNK - 1) / CHUNK));   // exact for batched
     }
 
-    // Dispatch based on state configuration and varlen
-    #define LAUNCH(HI, HO, FP32, VL) \
-        launch_fwd<128, HI, HO, FP32, VL>( \
-            q_ptr, k_ptr, v_ptr, g_ptr, beta_t_ptr, \
-            initial_state_raw, scale_f, final_state_raw, out_ptr, \
-            workspace_ptr, total_tiles, \
-            int(T_total), int(H), int(N_val), cu_seqlens_dev, \
-            A_log_ptr, dt_bias_ptr, gate_scale, stream)
-
-    #define DISPATCH_STATE(VL) \
-        if (!has_state_in && !has_state_out) { \
-            LAUNCH(false, false, false, VL); \
-        } else if (has_state_in && has_state_out && state_fp32) { \
-            LAUNCH(true, true, true, VL); \
-        } else if (has_state_in && has_state_out && !state_fp32) { \
-            LAUNCH(true, true, false, VL); \
-        } else if (!has_state_in && has_state_out && state_fp32) { \
-            LAUNCH(false, true, true, VL); \
-        } else if (!has_state_in && has_state_out && !state_fp32) { \
-            LAUNCH(false, true, false, VL); \
-        } else if (has_state_in && !has_state_out && state_fp32) { \
-            LAUNCH(true, false, true, VL); \
-        } else { \
-            LAUNCH(true, false, false, VL); \
-        }
-
-    if (is_varlen) {
-        DISPATCH_STATE(true);
-    } else {
-        DISPATCH_STATE(false);
-    }
-
-    #undef DISPATCH_STATE
-    #undef LAUNCH
+    dispatch_fwd(
+        has_state_in, has_state_out, state_fp32, is_varlen,
+        q_ptr, k_ptr, v_ptr, g_ptr, beta_t_ptr,
+        initial_state_raw, scale_f, final_state_raw, out_ptr,
+        workspace_ptr, total_tiles,
+        int(T_total), int(H), int(N_val), cu_seqlens_dev,
+        A_log_ptr, dt_bias_ptr, gate_scale, stream
+    );
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
