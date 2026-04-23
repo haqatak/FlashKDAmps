@@ -23,6 +23,25 @@ int64_t get_workspace_size(
 }
 
 
+inline bool check_tensors(
+    torch::Tensor const& q,
+    torch::Tensor const& k,
+    torch::Tensor const& v,
+    torch::Tensor const& g,
+    torch::Tensor const& beta,
+    torch::Tensor const& out,
+    torch::Tensor const& workspace,
+    torch::Tensor const& A_log,
+    torch::Tensor const& dt_bias,
+    std::optional<torch::Tensor> const& initial_state,
+    std::optional<torch::Tensor> const& final_state,
+    std::optional<torch::Tensor> const& cu_seqlens
+) {
+    TORCH_CHECK(q.is_cuda() && k.is_cuda() && v.is_cuda() && g.is_cuda() && beta.is_cuda() && out.is_cuda() && workspace.is_cuda(),
+                "all tensors must be on CUDA");
+    TORCH_CHECK(q.is_contiguous() && k.is_contiguous() && v.is_contiguous() && g.is_contiguous() && beta.is_contiguous() && out.is_contiguous() && workspace.is_contiguous(),
+                "all tensors must be contiguous");
+
 
 
 template <bool IsVarlen>
@@ -176,7 +195,6 @@ void fwd(
     int64_t T_seq = q.size(1);
     int64_t H = q.size(2);
     int64_t D = q.size(3);
-    int64_t T_total = B * T_seq;
 
     TORCH_CHECK(k.sizes() == q.sizes(), "k must match q shape");
     TORCH_CHECK(v.sizes() == q.sizes(), "v must match q shape");
@@ -225,8 +243,6 @@ void fwd(
     // Determine cu_seqlens and N
     bool is_varlen = cu_seqlens.has_value();
     int64_t N_val;
-    int64_t const* cu_seqlens_dev = nullptr;
-
     if (is_varlen) {
         TORCH_CHECK(B == 1, "B must be 1 when cu_seqlens is provided");
         auto& cu_seqlens_t = cu_seqlens.value();
@@ -235,19 +251,65 @@ void fwd(
         TORCH_CHECK(cu_seqlens_t.dim() == 1, "cu_seqlens must be 1D");
         N_val = cu_seqlens_t.numel() - 1;
         TORCH_CHECK(N_val > 0, "cu_seqlens must have at least 2 elements");
-        cu_seqlens_dev = cu_seqlens_t.data_ptr<int64_t>();
     } else {
         N_val = B;
     }
 
     auto [has_state_in, has_state_out, state_fp32] = validate_state_tensors(initial_state, final_state, N_val, H, D);
 
-    int total_tiles;
-    if (is_varlen) {
-        total_tiles = int((T_total + CHUNK - 1) / CHUNK + N_val);  // upper bound for varlen
-    } else {
-        total_tiles = int(N_val * ((T_seq + CHUNK - 1) / CHUNK));   // exact for batched
-    }
+    return state_fp32;
+}
+
+
+inline void dispatch_fwd(
+    bool has_state_in,
+    bool has_state_out,
+    bool state_fp32,
+    bool is_varlen,
+    cutlass::bfloat16_t const* q_ptr,
+    cutlass::bfloat16_t const* k_ptr,
+    cutlass::bfloat16_t const* v_ptr,
+    cutlass::bfloat16_t const* g_ptr,
+    cutlass::bfloat16_t const* beta_t_ptr,
+    void const* initial_state_raw,
+    float scale_f,
+    void* final_state_raw,
+    cutlass::bfloat16_t* out_ptr,
+    void* workspace_ptr,
+    int total_tiles,
+    int T_total,
+    int H,
+    int N_val,
+    int64_t const* cu_seqlens_dev,
+    float const* A_log_ptr,
+    float const* dt_bias_ptr,
+    float gate_scale,
+    cudaStream_t stream
+) {
+    #define LAUNCH(HI, HO, FP32, VL) \
+        launch_fwd<128, HI, HO, FP32, VL>( \
+            q_ptr, k_ptr, v_ptr, g_ptr, beta_t_ptr, \
+            initial_state_raw, scale_f, final_state_raw, out_ptr, \
+            workspace_ptr, total_tiles, \
+            T_total, H, N_val, cu_seqlens_dev, \
+            A_log_ptr, dt_bias_ptr, gate_scale, stream)
+
+    #define DISPATCH_STATE(VL) \
+        if (!has_state_in && !has_state_out) { \
+            LAUNCH(false, false, false, VL); \
+        } else if (has_state_in && has_state_out && state_fp32) { \
+            LAUNCH(true, true, true, VL); \
+        } else if (has_state_in && has_state_out && !state_fp32) { \
+            LAUNCH(true, true, false, VL); \
+        } else if (!has_state_in && has_state_out && state_fp32) { \
+            LAUNCH(false, true, true, VL); \
+        } else if (!has_state_in && has_state_out && !state_fp32) { \
+            LAUNCH(false, true, false, VL); \
+        } else if (has_state_in && !has_state_out && state_fp32) { \
+            LAUNCH(true, false, true, VL); \
+        } else { \
+            LAUNCH(true, false, false, VL); \
+        }
 
     // Dispatch based on state configuration and varlen
     if (is_varlen) {
@@ -261,6 +323,95 @@ void fwd(
             final_state_raw, out_ptr, workspace_ptr, total_tiles, int(T_total), int(H), int(N_val),
             cu_seqlens_dev, A_log_ptr, dt_bias_ptr, gate_scale, stream);
     }
+}
+
+void fwd(
+    torch::Tensor q,
+    torch::Tensor k,
+    torch::Tensor v,
+    torch::Tensor g,
+    torch::Tensor beta,
+    float scale,
+    torch::Tensor out,
+    torch::Tensor workspace,
+    torch::Tensor A_log,
+    torch::Tensor dt_bias,
+    double lower_bound,
+    std::optional<torch::Tensor> initial_state = std::nullopt,
+    std::optional<torch::Tensor> final_state = std::nullopt,
+    std::optional<torch::Tensor> cu_seqlens = std::nullopt
+) {
+    bool state_fp32 = check_tensors(q, k, v, g, beta, out, workspace, A_log, dt_bias, initial_state, final_state, cu_seqlens);
+
+    bool has_state_in = initial_state.has_value();
+    bool has_state_out = final_state.has_value();
+
+    int64_t B = q.size(0);
+    int64_t T_seq = q.size(1);
+    int64_t H = q.size(2);
+    int64_t D = q.size(3);
+    int64_t T_total = B * T_seq;
+
+    // Flatten [B, T, H, D] -> [B*T, H, D] (contiguous, same data pointer)
+    auto q_3d = q.reshape({T_total, H, D});
+    auto k_3d = k.reshape({T_total, H, D});
+    auto v_3d = v.reshape({T_total, H, D});
+    auto g_3d = g.reshape({T_total, H, D});
+    auto beta_2d = beta.reshape({T_total, H});
+    auto out_3d = out.reshape({T_total, H, D});
+
+    auto q_ptr = reinterpret_cast<cutlass::bfloat16_t const*>(q_3d.data_ptr<at::BFloat16>());
+    auto k_ptr = reinterpret_cast<cutlass::bfloat16_t const*>(k_3d.data_ptr<at::BFloat16>());
+    auto v_ptr = reinterpret_cast<cutlass::bfloat16_t const*>(v_3d.data_ptr<at::BFloat16>());
+    auto g_ptr = reinterpret_cast<cutlass::bfloat16_t const*>(g_3d.data_ptr<at::BFloat16>());
+    float scale_f = scale;
+    auto out_ptr = reinterpret_cast<cutlass::bfloat16_t*>(out_3d.data_ptr<at::BFloat16>());
+    auto A_log_ptr = A_log.data_ptr<float>();
+    auto dt_bias_ptr = dt_bias.data_ptr<float>();
+    float gate_scale = float(lower_bound * 1.4426950408889634);
+
+    // Transpose beta: [T_total, H] -> [H, T_total] (1D TMA, no T alignment constraint)
+    auto beta_t = beta_2d.t().contiguous();
+    auto beta_t_ptr = reinterpret_cast<cutlass::bfloat16_t const*>(beta_t.data_ptr<at::BFloat16>());
+
+    auto workspace_ptr = workspace.data_ptr();
+
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
+
+    constexpr int CHUNK = 16;
+
+    // Get state pointers (nullptr if not present)
+    void const* initial_state_raw = has_state_in ? initial_state->data_ptr() : nullptr;
+    void* final_state_raw = has_state_out ? final_state->data_ptr() : nullptr;
+
+    // Determine cu_seqlens and N
+    bool is_varlen = cu_seqlens.has_value();
+    int64_t N_val;
+    int64_t const* cu_seqlens_dev = nullptr;
+
+    if (is_varlen) {
+        auto& cu_seqlens_t = cu_seqlens.value();
+        N_val = cu_seqlens_t.numel() - 1;
+        cu_seqlens_dev = cu_seqlens_t.data_ptr<int64_t>();
+    } else {
+        N_val = B;
+    }
+
+    int total_tiles;
+    if (is_varlen) {
+        total_tiles = int((T_total + CHUNK - 1) / CHUNK + N_val);  // upper bound for varlen
+    } else {
+        total_tiles = int(N_val * ((T_seq + CHUNK - 1) / CHUNK));   // exact for batched
+    }
+
+    dispatch_fwd(
+        has_state_in, has_state_out, state_fp32, is_varlen,
+        q_ptr, k_ptr, v_ptr, g_ptr, beta_t_ptr,
+        initial_state_raw, scale_f, final_state_raw, out_ptr,
+        workspace_ptr, total_tiles,
+        int(T_total), int(H), int(N_val), cu_seqlens_dev,
+        A_log_ptr, dt_bias_ptr, gate_scale, stream
+    );
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
