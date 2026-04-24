@@ -129,11 +129,11 @@ def test_fp32_fma():
     assert res.dtype == torch.float32
 
     # 2. Test assertion failures for non-float32 inputs
-    with pytest.raises(AssertionError):
+    with pytest.raises(TypeError):
         fp32_fma(c.to(torch.float64), a, b)
-    with pytest.raises(AssertionError):
+    with pytest.raises(TypeError):
         fp32_fma(c, a.to(torch.float16), b)
-    with pytest.raises(AssertionError):
+    with pytest.raises(TypeError):
         fp32_fma(c, a, b.to(torch.bfloat16))
 
     # 3. Test precision benefits of intermediate float64
@@ -155,3 +155,9 @@ def test_fp32_fma():
 
     # With intermediate float64, it correctly retains the lost precision and returns 1.0
     assert res_prec.item() == 1.0
+
+    # 4. Test MPS branch (uses torch.addcmul)
+    from unittest.mock import PropertyMock
+    with patch('torch.Tensor.device', new_callable=PropertyMock, return_value=torch.device('mps')):
+        res_prec_mps = fp32_fma(c_prec, a_prec, b_prec)
+        assert res_prec_mps.item() == 1.0
