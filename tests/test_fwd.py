@@ -440,5 +440,8 @@ def test_fwd_varlen_vs_fla():
 if __name__ == "__main__":
     test_fwd()
     test_fwd_varlen()
-    test_fwd_vs_fla()
-    test_fwd_varlen_vs_fla()
+    if torch.cuda.is_available():
+        test_fwd_vs_fla()
+        test_fwd_varlen_vs_fla()
+    else:
+        print("Skipping FLA comparison tests (CUDA not available / triton not supported on MPS)")
