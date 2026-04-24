@@ -22,6 +22,10 @@ def fp32_fma(c, a, b):
         raise TypeError(f"Expected a.dtype to be torch.float32, got {a.dtype}")
     if b.dtype != torch.float32:
         raise TypeError(f"Expected b.dtype to be torch.float32, got {b.dtype}")
+
+    if c.device.type == 'mps':
+        return torch.addcmul(c, a, b)
+
     return (c.to(torch.float64) + a.to(torch.float64) * b.to(torch.float64)).to(torch.float32)
 
 
