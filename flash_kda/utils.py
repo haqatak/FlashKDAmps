@@ -16,9 +16,12 @@ def fp32_ex2_ftz(x):
 
 
 def fp32_fma(c, a, b):
-    assert c.dtype == torch.float32
-    assert a.dtype == torch.float32
-    assert b.dtype == torch.float32
+    if c.dtype != torch.float32:
+        raise TypeError(f"Expected c.dtype to be torch.float32, got {c.dtype}")
+    if a.dtype != torch.float32:
+        raise TypeError(f"Expected a.dtype to be torch.float32, got {a.dtype}")
+    if b.dtype != torch.float32:
+        raise TypeError(f"Expected b.dtype to be torch.float32, got {b.dtype}")
     return (c.to(torch.float64) + a.to(torch.float64) * b.to(torch.float64)).to(torch.float32)
 
 
